@@ -1,4 +1,4 @@
-![Luna](Luna_Assistant/assets/miss_luna.jpeg)
+![Luna](luna_desk/assets/luna_banner.png)
 
 ## 🌙 Luna - The Enchanted AI Assistant ✨  
 
@@ -23,10 +23,10 @@ Luna is crafted using the finest arcane technologies:
 ### 🛠️ Setup & Installation  
 Summon Luna into your system with these simple steps:  
 ```bash  
-git clone https://github.com/Khrizve/Luna-Assitant.git  
-cd luna-Virtual_Assistant
+git clone https://github.com/Khrizve/luna.git  
+cd luna
 pip install -r requirements.txt  
-python luna_assistant.py  
+python luna_v2.py  
 ```
 > **Note**: Ensure you have the **latest version of Python** and the required dependencies installed.  
 
@@ -36,14 +36,14 @@ Luna is more than an AI—she is an evolving entity. Her intelligence grows as s
 ### 📚 Roadmap  
 - ✅ Basic AI interactions  
 - ✅ Text-based conversation  
-- ☑️ Voice interactions (coming soon!)  
+- ☑️ Voice interactions  
 - ☑️ Deep integration with automation tools  
 - ☑️ Advanced learning capabilities  
 
 ### ✨ Contribute  
 Want to enhance Luna’s magical abilities? Contributions are always welcome! Fork the repository, make your improvements, and submit a pull request. Let's shape Luna into the ultimate AI assistant together.  
 
-### 🧙‍🏽‍🤺 Author  
+### 🧙‍ Author  
 Luna is a creation of **[Sorcerer](https://github.com/khrizve)**. Crafted with logic, magic, and a deep passion for AI. 🌟  
 
 ---  
