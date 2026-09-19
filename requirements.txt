@@ -1,0 +1,26 @@
+# GUI Framework & Utilities
+customtkinter
+Pillow
+requests
+
+# Speech Processing & TTS
+SpeechRecognition
+piper-tts
+
+# Entertainment & Media
+pyjokes
+yt-dlp
+
+# Face Recognition & Computer Vision
+opencv-python
+numpy
+
+# ------------------------------------------------------------
+# Additional System Dependencies (Non-Python)
+# ------------------------------------------------------------
+# The TTS module uses system command-line audio players to play speech.
+# Ensure at least one of the following is installed on your operating system:
+#
+# - Linux:   alsa-utils (for aplay), pulseaudio-utils (for paplay), or ffmpeg (for ffplay)
+# - Windows: ffmpeg (for ffplay) added to system PATH
+# - macOS:   ffmpeg (for ffplay) added to system PATH

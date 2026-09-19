@@ -1,0 +1,10 @@
+luna_desk/data/
+faces/
+models/
+voices/
+data/
+__pycache__/
+config.py
+luna.log
+*.pyc
+.env
