@@ -559,22 +559,27 @@ class LunaApp(ctk.CTk):
         self.page_container.grid_rowconfigure(0, weight=1)
         self.page_container.grid_columnconfigure(0, weight=1)
 
+        self.page_builders = {
+            "home": self._build_home_page,
+            "chat": self._build_chat_page,
+            "voice": self._build_voice_page,
+            "memories": self._build_memories_page,
+            "settings": self._build_settings_page,
+        }
         self.pages = {}
-        for key, builder in (
-            ("home", self._build_home_page),
-            ("chat", self._build_chat_page),
-            ("voice", self._build_voice_page),
-            ("memories", self._build_memories_page),
-            ("settings", self._build_settings_page),
-        ):
+        self.built_pages = set()
+        for key in self.page_builders:
             frame = ctk.CTkFrame(self.page_container, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
-            builder(frame)
             self.pages[key] = frame
+        self.pages["home"].tkraise()
 
         self._build_input_bar(center)
 
     def _show_page(self, key):
+        if key not in self.built_pages:
+            self.page_builders[key](self.pages[key])
+            self.built_pages.add(key)
         for k, btn in self.nav_buttons.items():
             if k == key:
                 btn.configure(fg_color=self.accent, text_color="#ffffff")
