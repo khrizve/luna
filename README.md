@@ -17,7 +17,7 @@ Luna is an AI-powered virtual assistant designed to assist you with tasks, answe
 ### ⚙️ Tech Stack  
 Luna is crafted using the finest arcane technologies:  
 - 👉 **Python** – The core spellbook.  
-- 👉 **CustomTkinter** – Enchanting graphical interface.   
+- 👉 **PyQt6** – Enchanting graphical interface.   
 - 👉 **TTS & STT APIs** – Giving Luna a voice of her own.  
 
 ### 🛠️ Setup & Installation  
