@@ -1,6 +1,6 @@
 """Luna — mystical AI desktop assistant.
 
-Fantasy-themed three-pane dashboard (CustomTkinter) on top of the original
+Fantasy-themed three-pane dashboard (PyQt6) on top of the original
 voice-assistant backend: speech I/O (Piper TTS + Google speech recognition),
 Gemini-powered Q&A, webcam face recognition, weather, web browsing/video
 playback, and OS control (shutdown/restart/sleep/open apps).
@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,16 +30,24 @@ import webbrowser
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import customtkinter as ctk
 import pyjokes
 import requests
 import speech_recognition as sr
-from PIL import Image, ImageDraw
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea,
+    QStackedWidget, QVBoxLayout, QWidget,
+)
 from piper import PiperVoice
 from piper.download_voices import download_voice
 
 try:
     import cv2
+    # opencv-python ships its own Qt plugins and points Qt at them, which breaks
+    # PyQt6 on Linux ("could not load the Qt platform plugin xcb"). Undo that.
+    os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
@@ -47,9 +57,6 @@ try:
     _NUMPY_AVAILABLE = True
 except ImportError:
     _NUMPY_AVAILABLE = False
-
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("dark-blue")
 
 # ------------------------------------------------------------
 # Persistent data (settings / memories / tasks / reminders / chat log)
@@ -175,13 +182,6 @@ LUNA_QUOTES = [
     "Better days are coming... keep going.",
     "Between the stars, I found a friend in you.",
 ]
-
-FONT_BRAND = ("Georgia", 24, "bold")
-FONT_H1 = ("Georgia", 20, "bold")
-FONT_H2 = ("Segoe UI", 13, "bold")
-FONT_BODY = ("Segoe UI", 12)
-FONT_SMALL = ("Segoe UI", 11)
-FONT_TINY = ("Segoe UI", 9)
 
 
 def apply_settings(new_values: dict) -> None:
@@ -455,20 +455,384 @@ _load_face_db()
 
 
 # ------------------------------------------------------------
-# GUI — fantasy three-pane dashboard
+# GUI — fantasy three-pane dashboard (PyQt6)
 # ------------------------------------------------------------
-class LunaApp(ctk.CTk):
+UI_FONT_FAMILIES = ["Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"]
+BODY_PX = 13
+BUBBLE_MAX_WIDTH = 420
+CHAT_VIEW_LIMIT = 500
+
+NAV_ITEMS = [
+    ("home", "🏠  Home"),
+    ("chat", "💬  Chat"),
+    ("voice", "🎙  Voice"),
+    ("memories", "🧠  Memories"),
+    ("settings", "⚙  Settings"),
+]
+PORTRAIT_FILES = ("luna_portrait.png", "luna_portrait.jpg", "miss_luna.jpeg", "miss_luna.jpg", "miss_luna.png")
+BANNER_FILES = ("luna_banner.png", "luna_banner.jpg") + PORTRAIT_FILES
+
+
+def build_stylesheet(accent: str, accent2: str) -> str:
+    """Application-wide stylesheet. Rebuilt whenever the theme changes, which
+    restyles every widget that picks up an accent color."""
+    return f"""
+    QWidget {{ color: {TEXT_LIGHT}; font-size: {BODY_PX}px; }}
+    QMainWindow, #center {{ background: {BG_DARK}; }}
+    QDialog {{ background: {PANEL_BG}; }}
+    QLabel {{ background: transparent; }}
+
+    QScrollArea {{ background: transparent; border: none; }}
+    #transparent, QScrollArea > QWidget > QWidget {{ background: transparent; }}
+    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+    QScrollBar::handle:vertical {{ background: {PANEL_BORDER}; border-radius: 4px; min-height: 30px; }}
+    QScrollBar::handle:vertical:hover {{ background: {accent}; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+
+    #sidebar {{ background: {PANEL_BG}; }}
+    #divider {{ background: {PANEL_BORDER}; border: none; min-height: 1px; max-height: 1px; }}
+    #hero {{ background: {PANEL_BG}; border: 2px solid {PANEL_BORDER}; border-radius: 22px; }}
+    #panel {{ background: {PANEL_BG}; border: 1px solid {PANEL_BORDER}; border-radius: 16px; }}
+    #inner {{ background: {PANEL_BG2}; border-radius: 12px; }}
+    #previewPanel {{ background: {PANEL_BG2}; border-radius: 16px; }}
+    #inputBar {{ background: {PANEL_BG}; border: 1px solid {PANEL_BORDER}; border-radius: 20px; }}
+
+    #brand {{ font-family: Georgia; font-size: 24px; font-weight: bold; color: {accent}; }}
+    #brandSig {{ font-family: Georgia; font-size: 11px; font-style: italic; color: {accent}; }}
+    #h1 {{ font-family: Georgia; font-size: 20px; font-weight: bold; }}
+    #h2 {{ font-size: 13px; font-weight: bold; color: {TEXT_MUTED}; }}
+    #greeting {{ font-family: Georgia; font-size: 22px; font-weight: bold; }}
+    #profileName {{ font-size: 16px; font-weight: bold; }}
+    #muted {{ color: {TEXT_MUTED}; font-size: 12px; }}
+    #tiny {{ color: {TEXT_MUTED}; font-size: 10px; }}
+    #quote {{ font-family: Georgia; font-size: 11px; font-style: italic; color: {TEXT_MUTED}; }}
+    #sectionTitle {{ color: {accent}; font-size: 13px; font-weight: bold; }}
+    #overviewValue {{ color: {accent2}; font-size: 11px; font-weight: bold; }}
+    #infoValue {{ font-size: 11px; font-weight: bold; }}
+
+    #bubbleUser, #bubbleLuna, #bubbleSystem, #bubbleError {{ border-radius: 14px; padding: 8px 12px; }}
+    #bubbleUser {{ background: {accent}; color: #ffffff; }}
+    #bubbleLuna {{ background: {PANEL_BG2}; }}
+    #bubbleSystem {{ background: {PANEL_BG2}; color: #ffd76a; }}
+    #bubbleError {{ background: {PANEL_BG2}; color: #ff6b6b; }}
+
+    QPushButton {{ background: {PANEL_BG2}; border: none; border-radius: 10px; padding: 8px 16px; }}
+    QPushButton:hover {{ background: {PANEL_BORDER}; }}
+    QPushButton#primary {{ background: {accent}; color: #ffffff; }}
+    QPushButton#primary:hover {{ background: {accent2}; }}
+    QPushButton#danger {{ background: #a83232; color: #ffffff; }}
+    QPushButton#danger:hover {{ background: #c94040; }}
+    QPushButton#nav {{ background: transparent; text-align: left; padding: 11px 14px; }}
+    QPushButton#nav:hover {{ background: {PANEL_BORDER}; }}
+    QPushButton#nav:checked {{ background: {accent}; color: #ffffff; }}
+    QPushButton#chip {{ border-radius: 16px; padding: 6px 14px; font-size: 12px; }}
+    QPushButton#qa {{ border-radius: 14px; padding: 8px; font-size: 12px; }}
+    QPushButton#qa:checked {{ background: {accent}; color: #ffffff; }}
+    QPushButton#appBtn {{ text-align: left; padding: 9px 14px; }}
+    QPushButton#roundBtn {{ border-radius: 21px; padding: 0; font-size: 15px; }}
+    QPushButton#roundBtnSmall {{ border-radius: 18px; padding: 0; font-size: 14px; }}
+    QPushButton#roundBtnAccent {{ background: {accent}; color: #ffffff; border-radius: 21px; padding: 0; font-size: 15px; }}
+    QPushButton#roundBtnAccent:hover {{ background: {accent2}; }}
+    QPushButton#link {{ background: transparent; color: {accent2}; font-size: 11px; padding: 3px 10px; border-radius: 6px; }}
+    QPushButton#link:hover {{ background: {PANEL_BORDER}; }}
+    QPushButton#dangerLink {{ background: transparent; color: #ff6b6b; font-size: 11px; padding: 3px 10px; border-radius: 6px; }}
+    QPushButton#dangerLink:hover {{ background: #5a1414; }}
+    QPushButton#powerShutdown {{ background: #3a0a0a; font-size: 11px; padding: 6px 4px; border-radius: 8px; }}
+    QPushButton#powerShutdown:hover {{ background: #5a1414; }}
+    QPushButton#powerRestart {{ background: #2a2a0a; font-size: 11px; padding: 6px 4px; border-radius: 8px; }}
+    QPushButton#powerRestart:hover {{ background: #4a4a14; }}
+    QPushButton#powerSleep {{ background: #0a1a3a; font-size: 11px; padding: 6px 4px; border-radius: 8px; }}
+    QPushButton#powerSleep:hover {{ background: #14285a; }}
+
+    QLineEdit, QPlainTextEdit {{ background: {PANEL_BG2}; border: none; border-radius: 10px; padding: 8px 10px;
+        selection-background-color: {accent}; }}
+    QLineEdit#chatEntry {{ background: transparent; padding: 0 8px; }}
+    QComboBox {{ background: {PANEL_BG2}; border: none; border-radius: 8px; padding: 6px 12px; min-width: 220px; }}
+    QComboBox QAbstractItemView {{ background: {PANEL_BG2}; border: 1px solid {PANEL_BORDER};
+        selection-background-color: {accent}; outline: 0; }}
+    QCheckBox {{ spacing: 10px; }}
+    QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 5px; border: 2px solid {PANEL_BORDER};
+        background: {PANEL_BG}; }}
+    QCheckBox::indicator:checked {{ background: {accent}; border-color: {accent}; }}
+    """
+
+
+def _blend_hex(hex_a: str, hex_b: str, t: float) -> str:
+    """Blends hex_a into hex_b by fraction t (0-1) — used to fake a
+    semi-transparent, theme-colored border."""
+    a = tuple(int(hex_a[i:i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(hex_b[i:i + 2], 16) for i in (1, 3, 5))
+    blended = tuple(int(a[i] * t + b[i] * (1 - t)) for i in range(3))
+    return "#{:02x}{:02x}{:02x}".format(*blended)
+
+
+def _discard(widget: QWidget) -> None:
+    """Removes a widget right away (hidden + unparented) and frees it once Qt is idle."""
+    widget.hide()
+    widget.setParent(None)
+    widget.deleteLater()
+
+
+def _clear_layout(layout) -> None:
+    while layout.count():
+        item = layout.takeAt(0)
+        widget = item.widget()
+        if widget is not None:
+            _discard(widget)
+        elif item.layout() is not None:
+            _clear_layout(item.layout())
+
+
+def _load_pixmap(names):
+    """First existing image from ./assets matching one of `names`, or None."""
+    path = next((p for p in (os.path.join("assets", n) for n in names) if os.path.exists(p)), None)
+    if path is None:
+        return None
+    pixmap = QPixmap(path)
+    return None if pixmap.isNull() else pixmap
+
+
+def _draw_cover(p: QPainter, target: QRectF, pixmap: QPixmap) -> None:
+    """Draws `pixmap` scaled to fill `target`, cropping the overflow evenly."""
+    iw, ih = pixmap.width(), pixmap.height()
+    scale = max(target.width() / iw, target.height() / ih)
+    sw, sh = target.width() / scale, target.height() / scale
+    p.drawPixmap(target, pixmap, QRectF((iw - sw) / 2, (ih - sh) / 2, sw, sh))
+
+
+def _paint_banner_placeholder(p: QPainter, rect: QRectF) -> None:
+    p.fillRect(rect, QColor(18, 14, 42))
+    cx, cy = rect.x() + rect.width() * 0.24, rect.y() + rect.height() * 0.5
+    r = rect.height() * 0.32
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(95, 55, 160))
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    p.setBrush(QColor(18, 14, 42))
+    p.drawEllipse(QRectF(cx - r + 18, cy - r - 10, 2 * r - 52, 2 * r + 2))
+    rng = random.Random(42)  # fixed seed so the star field doesn't jump around on repaint
+    p.setBrush(QColor(210, 200, 255, 160))
+    for _ in range(18):
+        x = rect.x() + rng.uniform(rect.width() * 0.4, rect.width() * 0.98)
+        y = rect.y() + rng.uniform(rect.height() * 0.06, rect.height() * 0.94)
+        s = rng.uniform(1.2, 2.6)
+        p.drawEllipse(QPointF(x, y), s, s)
+
+
+def make_avatar_pixmap(size: int) -> QPixmap:
+    """Circular portrait (or a painted placeholder), rendered at 2x for crispness."""
+    out = QPixmap(size * 2, size * 2)
+    out.setDevicePixelRatio(2)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    clip = QPainterPath()
+    clip.addEllipse(0, 0, size, size)
+    p.setClipPath(clip)
+    target = QRectF(0, 0, size, size)
+    portrait = _load_pixmap(PORTRAIT_FILES)
+    if portrait is not None:
+        _draw_cover(p, target, portrait)
+    else:
+        p.fillRect(target, QColor(20, 12, 46))
+        c, r = size / 2, size * 0.32
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(95, 55, 160))
+        p.drawEllipse(QPointF(c, c), r, r)
+        p.setBrush(QColor(20, 12, 46))
+        p.drawEllipse(QRectF(c - r + 10, c - r - 6, 2 * r - 32, 2 * r + 2))
+    p.end()
+    return out
+
+
+class ClickableRow(QWidget):
+    """Overview row: icon + name on the left, a value on the right; emits clicked."""
+    clicked = pyqtSignal()
+
+    def __init__(self, icon: str, name: str, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 3, 0, 3)
+        lay.addWidget(QLabel(f"{icon}  {name}"))
+        lay.addStretch(1)
+        self.value = QLabel("—")
+        self.value.setObjectName("overviewValue")
+        lay.addWidget(self.value)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class BannerWidget(QWidget):
+    """Home banner: portrait (or painted placeholder) in a rounded, theme-colored
+    frame, with the assistant's mode indicator dot in the corner."""
+
+    def __init__(self, accent: str, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(220)
+        self._accent = accent
+        self._dot = QColor(mode_colors["idle"])
+        self._image = _load_pixmap(BANNER_FILES)
+
+    def set_accent(self, accent: str) -> None:
+        self._accent = accent
+        self.update()
+
+    def set_dot_color(self, color: str) -> None:
+        self._dot = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        outer = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(PANEL_BG2))
+        p.drawRoundedRect(outer, 20, 20)
+
+        # Inset so the frame's own border ring stays visible on every side.
+        inner = outer.adjusted(3, 3, -3, -3)
+        clip = QPainterPath()
+        clip.addRoundedRect(inner, 17, 17)
+        p.save()
+        p.setClipPath(clip)
+        if self._image is not None:
+            _draw_cover(p, inner, self._image)
+        else:
+            _paint_banner_placeholder(p, inner)
+        p.restore()
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(_blend_hex(self._accent, PANEL_BG2, 0.4)), 2))
+        p.drawRoundedRect(outer, 20, 20)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._dot)
+        p.drawEllipse(QPointF(self.width() * 0.965 - 7, self.height() * 0.08 + 7), 7, 7)
+        p.end()
+
+
+class ChatView(QScrollArea):
+    """Scrollable list of chat bubbles, shared by the Home preview and the Chat page.
+    Messages are appended incrementally; `limit` caps how many stay on screen."""
+
+    def __init__(self, limit=None, parent=None):
+        super().__init__(parent)
+        self._limit = limit
+        self._rows = []
+        self._empty = None
+        self._pin = True  # stay scrolled to the newest message
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("transparent")
+        self._layout = QVBoxLayout(body)
+        self._layout.setContentsMargins(4, 4, 4, 4)
+        self._layout.setSpacing(8)
+        self._layout.addStretch(1)
+        self.setWidget(body)
+        self.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
+        self._show_empty()
+
+    def _on_range_changed(self, _low, high):
+        if self._pin:
+            self.verticalScrollBar().setValue(high)
+
+    def _show_empty(self):
+        self._empty = QLabel("No messages yet — say hello!")
+        self._empty.setObjectName("muted")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.insertWidget(0, self._empty)
+
+    def _hide_empty(self):
+        if self._empty is not None:
+            _discard(self._empty)
+            self._empty = None
+
+    def _drop_row(self, row):
+        self._layout.removeWidget(row)
+        _discard(row)
+
+    def set_history(self, history) -> None:
+        for row in self._rows:
+            self._drop_row(row)
+        self._rows.clear()
+        if self._limit:
+            history = history[-self._limit:]
+        self._pin = True
+        if not history:
+            if self._empty is None:
+                self._show_empty()
+            return
+        self._hide_empty()
+        for entry in history:
+            self._append_row(entry)
+
+    def add_message(self, entry: dict) -> None:
+        bar = self.verticalScrollBar()
+        self._pin = bar.value() >= bar.maximum() - 40
+        self._hide_empty()
+        self._append_row(entry)
+        if self._limit and len(self._rows) > self._limit:
+            self._drop_row(self._rows.pop(0))
+
+    def _append_row(self, entry: dict) -> None:
+        row = self._make_row(entry)
+        self._layout.insertWidget(self._layout.count() - 1, row)
+        self._rows.append(row)
+
+    @staticmethod
+    def _make_row(entry: dict) -> QWidget:
+        role = entry.get("role", "luna")
+        text = entry.get("text", "")
+        bubble = QLabel(text)
+        bubble.setObjectName({"user": "bubbleUser", "system": "bubbleSystem", "error": "bubbleError"}.get(role, "bubbleLuna"))
+        bubble.setTextFormat(Qt.TextFormat.PlainText)
+        bubble.setWordWrap(True)
+        bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # Word-wrapped QLabels pick a narrow width on their own, so size the
+        # bubble from the text: as wide as it needs, capped at BUBBLE_MAX_WIDTH.
+        font = bubble.font()
+        font.setPixelSize(BODY_PX)
+        metrics = QFontMetrics(font)
+        natural = max((metrics.horizontalAdvance(line) for line in text.splitlines()), default=0) + 34
+        bubble.setFixedWidth(min(BUBBLE_MAX_WIDTH, max(natural, 48)))
+
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        if role == "user":
+            lay.addStretch(1)
+            lay.addWidget(bubble)
+        else:
+            lay.addWidget(bubble)
+            lay.addStretch(1)
+        return row
+
+
+class LunaApp(QMainWindow):
+    # Backend threads (speech, face camera, voice loop...) only ever talk to the
+    # UI through these signals, so every widget is touched from the Qt main thread.
+    sig_message = pyqtSignal(str, str)
+    sig_mode = pyqtSignal(str)
+    sig_status = pyqtSignal(str)
+    sig_face = pyqtSignal(str)
+    sig_voice_btn = pyqtSignal(bool)
+    sig_voice_status = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
-        self.title("Luna — Mystical Assistant")
-        self.geometry("1536x1000")
-        self.minsize(1180, 760)
-        self.configure(fg_color=BG_DARK)
+        self.setWindowTitle("Luna — Mystical Assistant")
+        self.resize(1536, 1000)
+        self.setMinimumSize(1180, 760)
 
         self.accent = THEMES[THEME_NAME]["accent"]
         self.accent2 = THEMES[THEME_NAME]["accent2"]
-        self._theme_appliers = []
-        self._avatar_cache = {}
 
         self.chat_history = load_json(CHAT_HISTORY_PATH, [])
         self.memories = load_json(MEMORIES_PATH, [])
@@ -481,168 +845,240 @@ class LunaApp(ctk.CTk):
         self.quote_index = 0
         self.start_time = time.time()
         self.voice_listen_active = False
+        self._system_color = None
+        self._closed = False
 
         self._build_layout()
+        self._apply_theme()
+        self.home_chat_view.set_history(self.chat_history)
+        self.chat_page_view.set_history(self.chat_history)
+
+        self.sig_message.connect(self._on_message)
+        self.sig_mode.connect(self._on_mode)
+        self.sig_status.connect(self._on_status)
+        self.sig_face.connect(self._on_face)
+        self.sig_voice_btn.connect(self._on_voice_btn)
+        self.sig_voice_status.connect(self._on_voice_status)
+
         self._show_page("home")
         self._rotate_quote()
         self._tick_system_info()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._quote_timer = QTimer(self)
+        self._quote_timer.timeout.connect(self._rotate_quote)
+        self._quote_timer.start(9000)
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick_system_info)
+        self._tick_timer.start(1000)
+
+    # ---------------- thread-safe API used by the backend ----------------
+    def _emit(self, signal_name, *args):
+        """Emits a UI signal from any thread. Backend threads can outlive the
+        window during shutdown; once it is closing or already destroyed the
+        update is simply dropped instead of raising. The signal is looked up by
+        name inside the try block because merely touching it on a deleted
+        window already raises RuntimeError."""
+        if self._closed:
+            return
+        try:
+            getattr(self, signal_name).emit(*args)
+        except RuntimeError:  # underlying C++ window already deleted
+            self._closed = True
+
+    def append_message(self, role, text):
+        self._emit("sig_message", role, text)
+
+    def set_mode(self, mode):
+        self._emit("sig_mode", mode)
+
+    def set_status(self, text):
+        self._emit("sig_status", text)
+
+    def set_face_status(self, text):
+        self._emit("sig_face", text)
+
+    def set_voice_chat_active(self, active):
+        self._emit("sig_voice_btn", active)
+
+    # ---------------- signal slots (main thread) ----------------
+    def _on_message(self, role, text):
+        entry = {"role": role, "text": text, "ts": datetime.datetime.now().isoformat()}
+        self.chat_history.append(entry)
+        save_json(CHAT_HISTORY_PATH, self.chat_history[-500:])
+        self.home_chat_view.add_message(entry)
+        self.chat_page_view.add_message(entry)
+        self.update_overview()
+
+    def _on_mode(self, mode):
+        self.current_mode = mode
+        color = mode_colors.get(mode, self.accent)
+        self.banner.set_dot_color(color)
+        self.mode_status_label.setText(f"✦ {mode.capitalize()} ✦")
+        self._style_mode_label(color)
+
+    def _on_status(self, text):
+        self.mode_status_label.setText(text)
+
+    def _on_face(self, text):
+        self.info_labels["camera"].setText(text)
+
+    def _on_voice_btn(self, active):
+        self.voice_chat_btn.setChecked(active)
+
+    def _on_voice_status(self, text):
+        self.voice_status_label.setText(text)
+
+    def _style_mode_label(self, color):
+        self.mode_status_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: bold;")
 
     # ---------------- layout scaffolding ----------------
     def _build_layout(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        self._build_left_sidebar()
-        self._build_center()
-        self._build_right_sidebar()
+        central = QFrame()
+        central.setObjectName("center")
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_left_sidebar())
+        root.addWidget(self._build_center(), 1)
+        root.addWidget(self._build_right_sidebar())
 
-    def _section_header(self, parent, text):
-        ctk.CTkLabel(parent, text=text, font=FONT_H2, text_color=TEXT_MUTED).pack(
-            anchor="w", padx=20, pady=(10, 2)
-        )
+    def _apply_theme(self):
+        QApplication.instance().setStyleSheet(build_stylesheet(self.accent, self.accent2))
+        self.banner.set_accent(self.accent)
+        if self.current_mode == "idle":
+            self._style_mode_label(self.accent)
+
+    @staticmethod
+    def _label(text, name=None, wrap=False, align=None):
+        label = QLabel(text)
+        if name:
+            label.setObjectName(name)
+        if wrap:
+            label.setWordWrap(True)
+        if align is not None:
+            label.setAlignment(align)
+        return label
+
+    def _section_header(self, layout, text):
+        layout.addSpacing(10)
+        layout.addWidget(self._label(text, "h2"))
+        layout.addSpacing(6)
 
     # ---------------- left sidebar ----------------
     def _build_left_sidebar(self):
-        bar = ctk.CTkFrame(self, width=260, fg_color=PANEL_BG, corner_radius=0)
-        bar.grid(row=0, column=0, sticky="nsew")
-        bar.grid_propagate(False)
+        bar = QFrame()
+        bar.setObjectName("sidebar")
+        bar.setFixedWidth(260)
+        lay = QVBoxLayout(bar)
+        lay.setContentsMargins(22, 28, 22, 22)
+        lay.setSpacing(0)
 
-        brand = ctk.CTkFrame(bar, fg_color="transparent")
-        brand.pack(pady=(28, 18), padx=22, fill="x")
-        brand_label = ctk.CTkLabel(brand, text="☾ Luna", font=FONT_BRAND, text_color=self.accent)
-        brand_label.pack(anchor="w")
-        self._theme_appliers.append(lambda: brand_label.configure(text_color=self.accent))
-        ctk.CTkLabel(brand, text="Your AI Assistant", font=FONT_SMALL, text_color=TEXT_MUTED).pack(anchor="w")
+        lay.addWidget(self._label("☾ Luna", "brand"))
+        lay.addWidget(self._label("Your AI Assistant", "muted"))
+        lay.addSpacing(20)
 
-        nav_items = [
-            ("home", "🏠  Home"),
-            ("chat", "💬  Chat"),
-            ("voice", "🎙  Voice"),
-            ("memories", "🧠  Memories"),
-            ("settings", "⚙  Settings"),
-        ]
         self.nav_buttons = {}
-        nav_frame = ctk.CTkFrame(bar, fg_color="transparent")
-        nav_frame.pack(fill="x", padx=14, pady=6)
-        for key, label in nav_items:
-            btn = ctk.CTkButton(
-                nav_frame, text=label, anchor="w", font=FONT_BODY,
-                fg_color="transparent", hover_color=PANEL_BORDER, text_color=TEXT_LIGHT,
-                corner_radius=10, height=42, command=lambda k=key: self._show_page(k),
-            )
-            btn.pack(fill="x", pady=3)
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for key, label in NAV_ITEMS:
+            btn = QPushButton(label)
+            btn.setObjectName("nav")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, k=key: self._show_page(k))
+            group.addButton(btn)
+            lay.addWidget(btn)
+            lay.addSpacing(6)
             self.nav_buttons[key] = btn
 
-        ctk.CTkFrame(bar, fg_color=PANEL_BORDER, height=1).pack(fill="x", padx=20, pady=14)
-        ctk.CTkLabel(bar, text="").pack(expand=True, fill="both")
+        lay.addSpacing(8)
+        divider = QFrame()
+        divider.setObjectName("divider")
+        lay.addWidget(divider)
+        lay.addStretch(1)
 
-        quote_wrap = ctk.CTkFrame(bar, fg_color="transparent")
-        quote_wrap.pack(side="bottom", fill="x", padx=18, pady=22)
-        self.quote_label = ctk.CTkLabel(
-            quote_wrap, text="", font=("Georgia", 11, "italic"), text_color=TEXT_MUTED,
-            wraplength=210, justify="center",
-        )
-        self.quote_label.pack()
-        quote_sig = ctk.CTkLabel(quote_wrap, text="— Luna", font=("Georgia", 10, "italic"), text_color=self.accent)
-        quote_sig.pack(pady=(4, 0))
-        self._theme_appliers.append(lambda: quote_sig.configure(text_color=self.accent))
+        center = Qt.AlignmentFlag.AlignCenter
+        self.quote_label = self._label("", "quote", wrap=True, align=center)
+        lay.addWidget(self.quote_label)
+        lay.addSpacing(4)
+        lay.addWidget(self._label("— Luna", "brandSig", align=center))
+        return bar
 
     # ---------------- center column ----------------
     def _build_center(self):
-        center = ctk.CTkFrame(self, fg_color=BG_DARK, corner_radius=0)
-        center.grid(row=0, column=1, sticky="nsew")
-        center.grid_rowconfigure(0, weight=1)
-        center.grid_columnconfigure(0, weight=1)
+        center = QFrame()
+        center.setObjectName("center")
+        lay = QVBoxLayout(center)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(10)
 
-        self.page_container = ctk.CTkFrame(center, fg_color=BG_DARK)
-        self.page_container.grid(row=0, column=0, sticky="nsew", padx=18, pady=(18, 8))
-        self.page_container.grid_rowconfigure(0, weight=1)
-        self.page_container.grid_columnconfigure(0, weight=1)
-
-        self.page_builders = {
-            "home": self._build_home_page,
-            "chat": self._build_chat_page,
-            "voice": self._build_voice_page,
-            "memories": self._build_memories_page,
-            "settings": self._build_settings_page,
-        }
-        self.pages = {}
-        self.built_pages = set()
-        for key in self.page_builders:
-            frame = ctk.CTkFrame(self.page_container, fg_color="transparent")
-            frame.grid(row=0, column=0, sticky="nsew")
-            self.pages[key] = frame
-        self.pages["home"].tkraise()
-
-        self._build_input_bar(center)
+        self.pages = QStackedWidget()
+        self.page_index = {}
+        for key, builder in (
+            ("home", self._build_home_page),
+            ("chat", self._build_chat_page),
+            ("voice", self._build_voice_page),
+            ("memories", self._build_memories_page),
+            ("settings", self._build_settings_page),
+        ):
+            self.page_index[key] = self.pages.addWidget(builder())
+        lay.addWidget(self.pages, 1)
+        lay.addWidget(self._build_input_bar())
+        return center
 
     def _show_page(self, key):
-        if key not in self.built_pages:
-            self.page_builders[key](self.pages[key])
-            self.built_pages.add(key)
-        for k, btn in self.nav_buttons.items():
-            if k == key:
-                btn.configure(fg_color=self.accent, text_color="#ffffff")
-            else:
-                btn.configure(fg_color="transparent", text_color=TEXT_LIGHT)
-        self.pages[key].tkraise()
+        self.pages.setCurrentIndex(self.page_index[key])
+        self.nav_buttons[key].setChecked(True)
         self.current_page_key = key
-        if key == "chat":
-            self._render_chat(self.chat_page_scroll)
-        elif key == "memories":
+        if key == "memories":
             self._render_memories()
 
     # ---------------- Home page ----------------
-    def _build_home_page(self, frame):
-        hero = ctk.CTkFrame(frame, fg_color=PANEL_BG, corner_radius=22, border_width=2, border_color=PANEL_BORDER)
-        hero.pack(fill="both", expand=True)
+    def _build_home_page(self):
+        hero = QFrame()
+        hero.setObjectName("hero")
+        lay = QVBoxLayout(hero)
+        lay.setContentsMargins(30, 26, 30, 18)
+        lay.setSpacing(0)
+        center = Qt.AlignmentFlag.AlignCenter
 
-        self.banner_frame = ctk.CTkFrame(
-            hero, fg_color=PANEL_BG2, corner_radius=20, height=220,
-            border_width=2, border_color=self._blend_hex(self.accent, PANEL_BG2, 0.4),
-        )
-        self.banner_frame.pack(fill="x", padx=30, pady=(26, 10))
-        self.banner_frame.pack_propagate(False)
-        self._theme_appliers.append(
-            lambda: self.banner_frame.configure(border_color=self._blend_hex(self.accent, PANEL_BG2, 0.4))
-        )
-        self.banner_label = ctk.CTkLabel(self.banner_frame, text="", image=None)
-        self.banner_label.place(relx=0.5, rely=0.5, anchor="center")
-        self._banner_last_size = (0, 0)
-        self.banner_frame.bind("<Configure>", self._on_banner_resize)
+        self.banner = BannerWidget(self.accent)
+        lay.addWidget(self.banner)
+        lay.addSpacing(14)
 
-        self.mode_dot = ctk.CTkFrame(
-            self.banner_frame, width=14, height=14, corner_radius=7, fg_color=mode_colors["idle"], border_width=0,
-        )
-        self.mode_dot.place(relx=0.965, rely=0.08, anchor="ne")
+        self.greeting_label = self._label(f"Hello {USER_NAME}...  ♡", "greeting", align=center)
+        lay.addWidget(self.greeting_label)
+        lay.addSpacing(2)
+        lay.addWidget(self._label(
+            "I'm Luna, your AI assistant. What would you like to do today?", "muted", wrap=True, align=center,
+        ))
+        lay.addSpacing(6)
+        self.mode_status_label = self._label("✦ Idle ✦", align=center)
+        self._style_mode_label(self.accent)
+        lay.addWidget(self.mode_status_label)
+        lay.addSpacing(10)
 
-        self.greeting_label = ctk.CTkLabel(
-            hero, text=f"Hello {USER_NAME}...  ♡", font=("Georgia", 22, "bold"), text_color=TEXT_LIGHT
-        )
-        self.greeting_label.pack(pady=(4, 2))
-        ctk.CTkLabel(
-            hero, text="I'm Luna, your AI assistant. What would you like to do today?",
-            font=FONT_BODY, text_color=TEXT_MUTED, wraplength=520, justify="center",
-        ).pack(pady=(0, 6))
+        preview = QFrame()
+        preview.setObjectName("previewPanel")
+        preview_lay = QVBoxLayout(preview)
+        preview_lay.setContentsMargins(10, 10, 10, 10)
+        self.home_chat_view = ChatView(limit=6)
+        preview_lay.addWidget(self.home_chat_view)
+        lay.addWidget(preview, 1)
+        lay.addSpacing(14)
 
-        self.mode_status_label = ctk.CTkLabel(hero, text="✦ Idle ✦", font=("Segoe UI", 11, "bold"), text_color=self.accent)
-        self.mode_status_label.pack(pady=(0, 10))
-
-        preview_wrap = ctk.CTkFrame(hero, fg_color=PANEL_BG2, corner_radius=16)
-        preview_wrap.pack(fill="both", expand=True, padx=40, pady=(0, 14))
-        self.home_chat_scroll = ctk.CTkScrollableFrame(preview_wrap, fg_color="transparent")
-        self.home_chat_scroll.pack(fill="both", expand=True, padx=10, pady=10)
-
-        chip_row = ctk.CTkFrame(hero, fg_color="transparent")
-        chip_row.pack(pady=(0, 18))
+        chips = QHBoxLayout()
+        chips.setSpacing(10)
+        chips.addStretch(1)
         for chip in ["💭 Explain something", "💻 Help with coding", "📅 Plan my day", "🎲 Tell me a story"]:
-            ctk.CTkButton(
-                chip_row, text=chip, font=FONT_SMALL, fg_color=PANEL_BG2, hover_color=PANEL_BORDER,
-                text_color=TEXT_LIGHT, corner_radius=16, height=30,
-                command=lambda t=chip: self._send_quick_prompt(t),
-            ).pack(side="left", padx=5)
-
-        self._render_chat(self.home_chat_scroll, limit=6)
+            btn = QPushButton(chip)
+            btn.setObjectName("chip")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, t=chip: self._send_quick_prompt(t))
+            chips.addWidget(btn)
+        chips.addStretch(1)
+        lay.addLayout(chips)
+        return hero
 
     def _send_quick_prompt(self, chip_label):
         mapping = {
@@ -656,119 +1092,54 @@ class LunaApp(ctk.CTk):
         threading.Thread(target=process_command, args=(prompt.lower(),), daemon=True).start()
 
     # ---------------- Chat page ----------------
-    def _build_chat_page(self, frame):
-        ctk.CTkLabel(frame, text="Chat History", font=FONT_H1, text_color=TEXT_LIGHT).pack(anchor="w", pady=(4, 10))
-        wrap = ctk.CTkFrame(frame, fg_color=PANEL_BG, corner_radius=18, border_width=2, border_color=PANEL_BORDER)
-        wrap.pack(fill="both", expand=True)
-        self.chat_page_scroll = ctk.CTkScrollableFrame(wrap, fg_color="transparent")
-        self.chat_page_scroll.pack(fill="both", expand=True, padx=14, pady=14)
-
-    # ---------------- chat rendering (shared by Home + Chat page) ----------------
-    def _render_chat(self, container, limit=None):
-        for w in container.winfo_children():
-            w.destroy()
-        history = self.chat_history[-limit:] if limit else self.chat_history
-        if not history:
-            ctk.CTkLabel(container, text="No messages yet — say hello!", font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=10)
-            return
-        tag_colors = {"user": None, "luna": None, "system": "#ffd76a", "error": "#ff6b6b"}
-        for msg in history:
-            role = msg.get("role", "luna")
-            is_user = role == "user"
-            row = ctk.CTkFrame(container, fg_color="transparent")
-            row.pack(fill="x", pady=4)
-            text_color = TEXT_LIGHT
-            bubble_color = self.accent if is_user else PANEL_BG2
-            if role in ("system", "error"):
-                bubble_color = PANEL_BG2
-                text_color = tag_colors.get(role, TEXT_MUTED)
-            elif is_user:
-                text_color = "#ffffff"
-            bubble = ctk.CTkLabel(
-                row, text=msg.get("text", ""), font=FONT_BODY, justify="left", text_color=text_color,
-                fg_color=bubble_color, corner_radius=14, wraplength=380,
-            )
-            bubble.pack(side="right" if is_user else "left", padx=8, ipadx=8, ipady=6)
-        try:
-            container.update_idletasks()
-            container._parent_canvas.yview_moveto(1.0)
-        except Exception:
-            pass
-
-    def _refresh_chat_views(self):
-        if hasattr(self, "home_chat_scroll"):
-            self._render_chat(self.home_chat_scroll, limit=6)
-        if hasattr(self, "chat_page_scroll") and self.current_page_key == "chat":
-            self._render_chat(self.chat_page_scroll)
-        self.update_overview()
-
-    def append_message(self, role, text):
-        def _do():
-            entry = {"role": role, "text": text, "ts": datetime.datetime.now().isoformat()}
-            self.chat_history.append(entry)
-            save_json(CHAT_HISTORY_PATH, self.chat_history[-500:])
-            self._refresh_chat_views()
-        self.after(0, _do)
-
-    # ---------------- mode / status ----------------
-    def set_mode(self, mode):
-        def _do():
-            self.current_mode = mode
-            color = mode_colors.get(mode, self.accent)
-            if hasattr(self, "mode_dot"):
-                self.mode_dot.configure(fg_color=color)
-            if hasattr(self, "mode_status_label"):
-                self.mode_status_label.configure(text=f"✦ {mode.capitalize()} ✦", text_color=color)
-        self.after(0, _do)
-
-    def set_status(self, text):
-        def _do():
-            if hasattr(self, "mode_status_label"):
-                self.mode_status_label.configure(text=text)
-        self.after(0, _do)
-
-    def set_face_status(self, text):
-        def _do():
-            if hasattr(self, "info_labels"):
-                self.info_labels["camera"].configure(text=text)
-        self.after(0, _do)
+    def _build_chat_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(10)
+        lay.addWidget(self._label("Chat History", "h1"))
+        wrap = QFrame()
+        wrap.setObjectName("panel")
+        wrap_lay = QVBoxLayout(wrap)
+        wrap_lay.setContentsMargins(14, 14, 14, 14)
+        self.chat_page_view = ChatView(limit=CHAT_VIEW_LIMIT)
+        wrap_lay.addWidget(self.chat_page_view)
+        lay.addWidget(wrap, 1)
+        return page
 
     # ---------------- persistent input bar ----------------
-    def _build_input_bar(self, parent):
-        bar = ctk.CTkFrame(parent, fg_color=PANEL_BG, corner_radius=20, height=60, border_width=1, border_color=PANEL_BORDER)
-        bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
-        bar.grid_propagate(False)
-        bar.grid_columnconfigure(0, weight=1)
+    def _build_input_bar(self):
+        bar = QFrame()
+        bar.setObjectName("inputBar")
+        bar.setFixedHeight(60)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(20, 8, 10, 8)
+        lay.setSpacing(6)
 
-        self.chat_entry = ctk.CTkEntry(
-            bar, placeholder_text="Type your message...", font=FONT_BODY,
-            fg_color="transparent", border_width=0, text_color=TEXT_LIGHT,
-        )
-        self.chat_entry.grid(row=0, column=0, sticky="ew", padx=(20, 8), pady=10)
-        self.chat_entry.bind("<Return>", lambda e: self._handle_send())
+        self.chat_entry = QLineEdit()
+        self.chat_entry.setObjectName("chatEntry")
+        self.chat_entry.setPlaceholderText("Type your message...")
+        self.chat_entry.returnPressed.connect(self._handle_send)
+        lay.addWidget(self.chat_entry, 1)
 
-        ctk.CTkButton(
-            bar, text="🔇", width=36, height=36, corner_radius=18, fg_color=PANEL_BG2,
-            hover_color=PANEL_BORDER, command=mute_luna,
-        ).grid(row=0, column=1, padx=2, pady=8)
-
-        ctk.CTkButton(
-            bar, text="🎙", width=42, height=42, corner_radius=21, fg_color=PANEL_BG2,
-            hover_color=PANEL_BORDER, command=self._handle_mic,
-        ).grid(row=0, column=2, padx=4, pady=8)
-
-        send_btn = ctk.CTkButton(
-            bar, text="➤", width=42, height=42, corner_radius=21,
-            fg_color=self.accent, hover_color=self.accent2, command=self._handle_send,
-        )
-        send_btn.grid(row=0, column=3, padx=(4, 10), pady=8)
-        self._theme_appliers.append(lambda: send_btn.configure(fg_color=self.accent, hover_color=self.accent2))
+        for text, name, size, slot in (
+            ("🔇", "roundBtnSmall", 36, mute_luna),
+            ("🎙", "roundBtn", 42, self._handle_mic),
+            ("➤", "roundBtnAccent", 42, self._handle_send),
+        ):
+            btn = QPushButton(text)
+            btn.setObjectName(name)
+            btn.setFixedSize(size, size)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(slot)
+            lay.addWidget(btn)
+        return bar
 
     def _handle_send(self):
-        text = self.chat_entry.get().strip()
+        text = self.chat_entry.text().strip()
         if not text:
             return
-        self.chat_entry.delete(0, "end")
+        self.chat_entry.clear()
         self.append_message("user", text)
         threading.Thread(target=process_command, args=(text.lower(),), daemon=True).start()
 
@@ -780,212 +1151,147 @@ class LunaApp(ctk.CTk):
         if cmd:
             process_command(cmd)
 
-    # ---------------- avatar image ----------------
-    def _load_avatar_image(self, size):
-        if size in self._avatar_cache:
-            return self._avatar_cache[size]
-        candidates = [
-            os.path.join("assets", n)
-            for n in ("luna_portrait.png", "luna_portrait.jpg", "miss_luna.jpeg", "miss_luna.jpg", "miss_luna.png")
-        ]
-        path = next((p for p in candidates if os.path.exists(p)), None)
-        img = None
-        if path:
-            try:
-                img = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
-            except Exception:
-                img = None
-        if img is None:
-            img = self._placeholder_avatar(size)
-        mask = Image.new("L", (size, size), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
-        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        out.paste(img, (0, 0), mask)
-        photo = ctk.CTkImage(light_image=out, dark_image=out, size=(size, size))
-        self._avatar_cache[size] = photo
-        return photo
-
-    @staticmethod
-    def _placeholder_avatar(size):
-        ph = Image.new("RGBA", (size, size), (20, 12, 46, 255))
-        d = ImageDraw.Draw(ph)
-        c = size // 2
-        r = int(size * 0.32)
-        d.ellipse((c - r, c - r, c + r, c + r), fill=(95, 55, 160, 255))
-        d.ellipse((c - r + 10, c - r - 6, c + r - 22, c + r - 4), fill=(20, 12, 46, 255))
-        return ph
-
-    @staticmethod
-    def _blend_hex(hex_a: str, hex_b: str, t: float) -> str:
-        """Blends hex_a into hex_b by fraction t (0-1) — used to fake a
-        semi-transparent, theme-colored border since Tk colors have no
-        alpha channel."""
-        a = tuple(int(hex_a[i:i + 2], 16) for i in (1, 3, 5))
-        b = tuple(int(hex_b[i:i + 2], 16) for i in (1, 3, 5))
-        blended = tuple(int(a[i] * t + b[i] * (1 - t)) for i in range(3))
-        return "#{:02x}{:02x}{:02x}".format(*blended)
-
-    def _load_banner_image(self, width, height):
-        cache_key = ("banner", width, height)
-        if cache_key in self._avatar_cache:
-            return self._avatar_cache[cache_key]
-        candidates = [
-            os.path.join("assets", n)
-            for n in ("luna_banner.png", "luna_banner.jpg", "luna_portrait.png", "luna_portrait.jpg",
-                      "miss_luna.jpeg", "miss_luna.jpg", "miss_luna.png")
-        ]
-        path = next((p for p in candidates if os.path.exists(p)), None)
-        img = None
-        if path:
-            try:
-                from PIL import ImageOps
-                img = ImageOps.fit(Image.open(path).convert("RGBA"), (width, height), Image.LANCZOS)
-            except Exception:
-                img = None
-        if img is None:
-            img = self._placeholder_banner(width, height)
-        radius = 18
-        mask = Image.new("L", (width, height), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, width, height), radius=radius, fill=255)
-        out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        out.paste(img, (0, 0), mask)
-        photo = ctk.CTkImage(light_image=out, dark_image=out, size=(width, height))
-        self._avatar_cache[cache_key] = photo
-        return photo
-
-    @staticmethod
-    def _placeholder_banner(width, height):
-        ph = Image.new("RGBA", (width, height), (18, 14, 42, 255))
-        d = ImageDraw.Draw(ph)
-        cx, cy = width * 0.24, height * 0.5
-        r = height * 0.32
-        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(95, 55, 160, 255))
-        d.ellipse((cx - r + 18, cy - r - 10, cx + r - 34, cy + r - 8), fill=(18, 14, 42, 255))
-        import random as _r
-        rng = _r.Random(42)  # fixed seed so the star field doesn't jump around on resize
-        for _ in range(18):
-            x = rng.uniform(width * 0.4, width * 0.98)
-            y = rng.uniform(height * 0.06, height * 0.94)
-            s = rng.uniform(1.2, 2.6)
-            d.ellipse((x - s, y - s, x + s, y + s), fill=(210, 200, 255, 160))
-        return ph
-
-    def _on_banner_resize(self, event):
-        # Inset by 8px so the frame's own border ring stays visible on every
-        # side (an edge-to-edge image would otherwise paint over it).
-        w, h = max(120, event.width - 8), max(60, event.height - 8)
-        last_w, last_h = self._banner_last_size
-        if abs(w - last_w) < 6 and abs(h - last_h) < 6:
-            return
-        self._banner_last_size = (w, h)
-        self.banner_label.configure(image=self._load_banner_image(w, h))
-
     # ---------------- Voice page ----------------
-    def _build_voice_page(self, frame):
-        ctk.CTkLabel(frame, text="Voice", font=FONT_H1, text_color=TEXT_LIGHT).pack(anchor="w", pady=(4, 4))
-        ctk.CTkLabel(
-            frame, text="Choose the neural voice Luna speaks with (Piper TTS, fully offline once downloaded).",
-            font=FONT_SMALL, text_color=TEXT_MUTED, wraplength=520, justify="left",
-        ).pack(anchor="w", pady=(0, 14))
+    def _build_voice_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._label("Voice", "h1"))
+        lay.addSpacing(4)
+        lay.addWidget(self._label(
+            "Choose the neural voice Luna speaks with (Piper TTS, fully offline once downloaded).", "muted", wrap=True,
+        ))
+        lay.addSpacing(14)
 
-        box = self._settings_section(frame, "Assistant Voice")
-        row = ctk.CTkFrame(box, fg_color="transparent")
-        row.pack(fill="x", pady=6)
-        ctk.CTkLabel(row, text="Voice", font=FONT_SMALL, text_color=TEXT_MUTED, width=100, anchor="w").pack(side="left")
-        self.voice_menu = ctk.CTkOptionMenu(
-            row, values=PIPER_VOICE_OPTIONS, fg_color=PANEL_BG2,
-            button_color=self.accent, button_hover_color=self.accent2,
+        box = self._settings_section(lay, "Assistant Voice")
+        self.voice_menu = QComboBox()
+        self.voice_menu.addItems(PIPER_VOICE_OPTIONS)
+        self.voice_menu.setCurrentText(PIPER_VOICE_NAME if PIPER_VOICE_NAME in PIPER_VOICE_OPTIONS else PIPER_VOICE_OPTIONS[0])
+        box.addLayout(self._form_row("Voice", self.voice_menu, label_width=100))
+
+        buttons = QHBoxLayout()
+        apply_btn = QPushButton("Apply Voice")
+        apply_btn.setObjectName("primary")
+        apply_btn.clicked.connect(self._apply_voice)
+        test_btn = QPushButton("🔊 Test Speech")
+        test_btn.clicked.connect(
+            lambda: threading.Thread(target=speak, args=("Hello! This is how I sound.",), daemon=True).start()
         )
-        self.voice_menu.set(PIPER_VOICE_NAME if PIPER_VOICE_NAME in PIPER_VOICE_OPTIONS else PIPER_VOICE_OPTIONS[0])
-        self.voice_menu.pack(side="left", padx=(6, 0))
-        self._theme_appliers.append(
-            lambda: self.voice_menu.configure(button_color=self.accent, button_hover_color=self.accent2)
+        buttons.addWidget(apply_btn)
+        buttons.addWidget(test_btn)
+        buttons.addStretch(1)
+        box.addLayout(buttons)
+
+        self.voice_status_label = self._label(
+            "Voice ready ✓" if _PIPER_READY else "Voice not ready — apply to download.", "tiny",
         )
-
-        btn_row = ctk.CTkFrame(box, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 4))
-        apply_btn = ctk.CTkButton(btn_row, text="Apply Voice", fg_color=self.accent, hover_color=self.accent2, command=self._apply_voice)
-        apply_btn.pack(side="left")
-        self._theme_appliers.append(lambda: apply_btn.configure(fg_color=self.accent, hover_color=self.accent2))
-        ctk.CTkButton(
-            btn_row, text="🔊 Test Speech", fg_color=PANEL_BG2, hover_color=PANEL_BORDER,
-            command=lambda: threading.Thread(target=speak, args=("Hello! This is how I sound.",), daemon=True).start(),
-        ).pack(side="left", padx=8)
-
-        self.voice_status_label = ctk.CTkLabel(box, text=("Voice ready ✓" if _PIPER_READY else "Voice not ready — apply to download."), font=FONT_TINY, text_color=TEXT_MUTED)
-        self.voice_status_label.pack(anchor="w", pady=(6, 0))
+        box.addWidget(self.voice_status_label)
+        lay.addStretch(1)
+        return page
 
     def _apply_voice(self):
-        chosen = self.voice_menu.get()
-        self.voice_status_label.configure(text="Downloading & applying voice…")
+        chosen = self.voice_menu.currentText()
+        self.voice_status_label.setText("Downloading & applying voice…")
 
         def worker():
             apply_settings({"piper_voice": chosen})
             ok = _init_piper_voice()
-            text = "Voice ready ✓" if ok else "Failed to load voice — check your connection."
-            self.after(0, lambda: self.voice_status_label.configure(text=text))
+            self._emit("sig_voice_status", "Voice ready ✓" if ok else "Failed to load voice — check your connection.")
 
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- Memories page ----------------
-    def _build_memories_page(self, frame):
-        ctk.CTkLabel(frame, text="Memories", font=FONT_H1, text_color=TEXT_LIGHT).pack(anchor="w", pady=(4, 4))
-        ctk.CTkLabel(
-            frame, text="Things Luna remembers about you — she uses these to personalize her answers.",
-            font=FONT_SMALL, text_color=TEXT_MUTED,
-        ).pack(anchor="w", pady=(0, 10))
+    def _build_memories_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._label("Memories", "h1"))
+        lay.addSpacing(4)
+        lay.addWidget(self._label(
+            "Things Luna remembers about you — she uses these to personalize her answers.", "muted",
+        ))
+        lay.addSpacing(10)
 
-        add_wrap = ctk.CTkFrame(frame, fg_color=PANEL_BG, corner_radius=16, border_width=1, border_color=PANEL_BORDER)
-        add_wrap.pack(fill="x", pady=(0, 14))
-        self.memory_input = ctk.CTkTextbox(
-            add_wrap, height=70, fg_color=PANEL_BG2, text_color=TEXT_LIGHT, corner_radius=10, font=FONT_BODY,
-        )
-        self.memory_input.pack(fill="x", padx=14, pady=(14, 8))
-        btn_row = ctk.CTkFrame(add_wrap, fg_color="transparent")
-        btn_row.pack(fill="x", padx=14, pady=(0, 14))
-        self.memory_save_btn = ctk.CTkButton(
-            btn_row, text="Save Memory", fg_color=self.accent, hover_color=self.accent2, command=self._save_memory,
-        )
-        self.memory_save_btn.pack(side="left")
-        self._theme_appliers.append(lambda: self.memory_save_btn.configure(fg_color=self.accent, hover_color=self.accent2))
-        ctk.CTkButton(
-            btn_row, text="Cancel Edit", fg_color=PANEL_BG2, hover_color=PANEL_BORDER, command=self._cancel_memory_edit,
-        ).pack(side="left", padx=8)
+        add_wrap = QFrame()
+        add_wrap.setObjectName("panel")
+        add_lay = QVBoxLayout(add_wrap)
+        add_lay.setContentsMargins(14, 14, 14, 14)
+        add_lay.setSpacing(8)
+        self.memory_input = QPlainTextEdit()
+        self.memory_input.setFixedHeight(70)
+        add_lay.addWidget(self.memory_input)
+        buttons = QHBoxLayout()
+        self.memory_save_btn = QPushButton("Save Memory")
+        self.memory_save_btn.setObjectName("primary")
+        self.memory_save_btn.clicked.connect(self._save_memory)
+        cancel_btn = QPushButton("Cancel Edit")
+        cancel_btn.clicked.connect(self._cancel_memory_edit)
+        buttons.addWidget(self.memory_save_btn)
+        buttons.addWidget(cancel_btn)
+        buttons.addStretch(1)
+        add_lay.addLayout(buttons)
+        lay.addWidget(add_wrap)
+        lay.addSpacing(14)
 
-        list_wrap = ctk.CTkFrame(frame, fg_color=PANEL_BG, corner_radius=16, border_width=1, border_color=PANEL_BORDER)
-        list_wrap.pack(fill="both", expand=True)
-        self.memories_scroll = ctk.CTkScrollableFrame(list_wrap, fg_color="transparent")
-        self.memories_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        list_wrap = QFrame()
+        list_wrap.setObjectName("panel")
+        list_lay = QVBoxLayout(list_wrap)
+        list_lay.setContentsMargins(10, 10, 10, 10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("transparent")
+        self.memories_layout = QVBoxLayout(body)
+        self.memories_layout.setContentsMargins(2, 2, 2, 2)
+        self.memories_layout.setSpacing(10)
+        scroll.setWidget(body)
+        list_lay.addWidget(scroll)
+        lay.addWidget(list_wrap, 1)
         self._render_memories()
+        return page
 
     def _render_memories(self):
-        for w in self.memories_scroll.winfo_children():
-            w.destroy()
+        _clear_layout(self.memories_layout)
         if not self.memories:
-            ctk.CTkLabel(self.memories_scroll, text="No memories yet — add one above.", text_color=TEXT_MUTED).pack(pady=10)
-            return
-        for mem in reversed(self.memories):
-            card = ctk.CTkFrame(self.memories_scroll, fg_color=PANEL_BG2, corner_radius=12)
-            card.pack(fill="x", pady=5, padx=2)
-            ctk.CTkLabel(
-                card, text=mem["text"], font=FONT_BODY, text_color=TEXT_LIGHT,
-                wraplength=380, justify="left", anchor="w",
-            ).pack(fill="x", padx=12, pady=(10, 4))
-            meta_row = ctk.CTkFrame(card, fg_color="transparent")
-            meta_row.pack(fill="x", padx=12, pady=(0, 10))
-            ts = mem.get("created_at", "")[:16].replace("T", " ")
-            ctk.CTkLabel(meta_row, text=ts, font=FONT_TINY, text_color=TEXT_MUTED).pack(side="left")
-            ctk.CTkButton(
-                meta_row, text="Edit", width=50, height=24, font=FONT_TINY, fg_color="transparent",
-                hover_color=PANEL_BORDER, text_color=self.accent2, command=lambda m=mem: self._edit_memory(m),
-            ).pack(side="right", padx=2)
-            ctk.CTkButton(
-                meta_row, text="Delete", width=55, height=24, font=FONT_TINY, fg_color="transparent",
-                hover_color="#5a1414", text_color="#ff6b6b", command=lambda m=mem: self._delete_memory(m),
-            ).pack(side="right", padx=2)
+            self.memories_layout.addWidget(
+                self._label("No memories yet — add one above.", "muted", align=Qt.AlignmentFlag.AlignCenter)
+            )
+        else:
+            for mem in reversed(self.memories):
+                self.memories_layout.addWidget(self._memory_card(mem))
+        self.memories_layout.addStretch(1)
+
+    def _memory_card(self, mem):
+        card = QFrame()
+        card.setObjectName("inner")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 8)
+        lay.setSpacing(4)
+        text = self._label(mem["text"], wrap=True)
+        text.setTextFormat(Qt.TextFormat.PlainText)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(text)
+
+        meta = QHBoxLayout()
+        meta.addWidget(self._label(mem.get("created_at", "")[:16].replace("T", " "), "tiny"))
+        meta.addStretch(1)
+        edit_btn = QPushButton("Edit")
+        edit_btn.setObjectName("link")
+        edit_btn.clicked.connect(lambda _=False, m=mem: self._edit_memory(m))
+        delete_btn = QPushButton("Delete")
+        delete_btn.setObjectName("dangerLink")
+        delete_btn.clicked.connect(lambda _=False, m=mem: self._delete_memory(m))
+        meta.addWidget(edit_btn)
+        meta.addWidget(delete_btn)
+        lay.addLayout(meta)
+        return card
 
     def _save_memory(self):
-        text = self.memory_input.get("1.0", "end").strip()
+        text = self.memory_input.toPlainText().strip()
         if not text:
             return
         if self.editing_memory_id:
@@ -994,23 +1300,22 @@ class LunaApp(ctk.CTk):
                     m["text"] = text
                     break
             self.editing_memory_id = None
-            self.memory_save_btn.configure(text="Save Memory")
+            self.memory_save_btn.setText("Save Memory")
         else:
             self.memories.append({"id": str(uuid.uuid4()), "text": text, "created_at": datetime.datetime.now().isoformat()})
         save_json(MEMORIES_PATH, self.memories)
-        self.memory_input.delete("1.0", "end")
+        self.memory_input.clear()
         self._render_memories()
 
     def _edit_memory(self, mem):
         self.editing_memory_id = mem["id"]
-        self.memory_input.delete("1.0", "end")
-        self.memory_input.insert("1.0", mem["text"])
-        self.memory_save_btn.configure(text="Update Memory")
+        self.memory_input.setPlainText(mem["text"])
+        self.memory_save_btn.setText("Update Memory")
 
     def _cancel_memory_edit(self):
         self.editing_memory_id = None
-        self.memory_input.delete("1.0", "end")
-        self.memory_save_btn.configure(text="Save Memory")
+        self.memory_input.clear()
+        self.memory_save_btn.setText("Save Memory")
 
     def _delete_memory(self, mem):
         self.memories = [m for m in self.memories if m["id"] != mem["id"]]
@@ -1018,66 +1323,84 @@ class LunaApp(ctk.CTk):
         self._render_memories()
 
     # ---------------- Settings page ----------------
-    def _settings_section(self, parent, title):
-        box = ctk.CTkFrame(parent, fg_color=PANEL_BG, corner_radius=16, border_width=1, border_color=PANEL_BORDER)
-        box.pack(fill="x", pady=8)
-        header = ctk.CTkLabel(box, text=title, font=FONT_H2, text_color=self.accent)
-        header.pack(anchor="w", padx=16, pady=(12, 4))
-        self._theme_appliers.append(lambda: header.configure(text_color=self.accent))
-        inner = ctk.CTkFrame(box, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=(0, 12))
+    def _settings_section(self, parent_layout, title):
+        """Adds a titled card to parent_layout and returns the layout to fill."""
+        box = QFrame()
+        box.setObjectName("panel")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(6)
+        outer.addWidget(self._label(title, "sectionTitle"))
+        inner = QVBoxLayout()
+        inner.setSpacing(10)
+        outer.addLayout(inner)
+        parent_layout.addWidget(box)
+        parent_layout.addSpacing(8)
         return inner
 
-    def _build_settings_page(self, frame):
-        scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        ctk.CTkLabel(scroll, text="Settings", font=FONT_H1, text_color=TEXT_LIGHT).pack(anchor="w", pady=(4, 14))
+    def _form_row(self, label, widget, label_width=140):
+        row = QHBoxLayout()
+        caption = self._label(label, "muted")
+        caption.setFixedWidth(label_width)
+        row.addWidget(caption)
+        row.addWidget(widget, 1)
+        return row
 
-        api_box = self._settings_section(scroll, "API & Profile")
+    def _build_settings_page(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("transparent")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 4, 8, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._label("Settings", "h1"))
+        lay.addSpacing(14)
+
+        api_box = self._settings_section(lay, "API & Profile")
         self.settings_entries = {}
         field_values = {
             "gemini_api_key": GEMINI_API_KEY, "weather_api_key": WEATHER_API_KEY,
             "home_city": HOME_CITY, "user_name": USER_NAME,
         }
-        for key, label, mask in [
-            ("gemini_api_key", "Gemini API Key", "*"),
-            ("weather_api_key", "Weather API Key", "*"),
-            ("home_city", "Home City", None),
-            ("user_name", "Your Name", None),
+        for key, label, secret in [
+            ("gemini_api_key", "Gemini API Key", True),
+            ("weather_api_key", "Weather API Key", True),
+            ("home_city", "Home City", False),
+            ("user_name", "Your Name", False),
         ]:
-            row = ctk.CTkFrame(api_box, fg_color="transparent")
-            row.pack(fill="x", pady=5)
-            ctk.CTkLabel(row, text=label, font=FONT_SMALL, text_color=TEXT_MUTED, width=140, anchor="w").pack(side="left")
-            entry = ctk.CTkEntry(row, fg_color=PANEL_BG2, text_color=TEXT_LIGHT, border_width=0, show=mask)
-            entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
-            entry.insert(0, field_values.get(key, ""))
+            entry = QLineEdit(field_values.get(key, ""))
+            if secret:
+                entry.setEchoMode(QLineEdit.EchoMode.Password)
+            api_box.addLayout(self._form_row(label, entry))
             self.settings_entries[key] = entry
-        save_api_btn = ctk.CTkButton(api_box, text="Save API Settings", fg_color=self.accent, hover_color=self.accent2, command=self._save_api_settings)
-        save_api_btn.pack(anchor="e", pady=(10, 4))
-        self._theme_appliers.append(lambda: save_api_btn.configure(fg_color=self.accent, hover_color=self.accent2))
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        save_btn = QPushButton("Save API Settings")
+        save_btn.setObjectName("primary")
+        save_btn.clicked.connect(self._save_api_settings)
+        save_row.addWidget(save_btn)
+        api_box.addLayout(save_row)
 
-        theme_box = self._settings_section(scroll, "Appearance")
-        row = ctk.CTkFrame(theme_box, fg_color="transparent")
-        row.pack(fill="x", pady=5)
-        ctk.CTkLabel(row, text="Theme", font=FONT_SMALL, text_color=TEXT_MUTED, width=140, anchor="w").pack(side="left")
-        self.theme_menu = ctk.CTkOptionMenu(
-            row, values=[t["name"] for t in THEMES.values()], command=self._on_theme_selected,
-            fg_color=PANEL_BG2, button_color=self.accent, button_hover_color=self.accent2,
-        )
-        self.theme_menu.set(THEMES[THEME_NAME]["name"])
-        self.theme_menu.pack(side="left", padx=(6, 0))
-        self._theme_appliers.append(
-            lambda: self.theme_menu.configure(button_color=self.accent, button_hover_color=self.accent2)
-        )
+        theme_box = self._settings_section(lay, "Appearance")
+        self.theme_menu = QComboBox()
+        self.theme_menu.addItems([t["name"] for t in THEMES.values()])
+        self.theme_menu.setCurrentText(THEMES[THEME_NAME]["name"])
+        self.theme_menu.textActivated.connect(self._on_theme_selected)
+        theme_box.addLayout(self._form_row("Theme", self.theme_menu))
 
-        sys_box = self._settings_section(scroll, "System")
-        ctk.CTkLabel(
-            sys_box, text="Use the power icons in the right sidebar to shut down, restart, or sleep this computer.",
-            font=FONT_SMALL, text_color=TEXT_MUTED, wraplength=440, justify="left",
-        ).pack(anchor="w", pady=6)
+        sys_box = self._settings_section(lay, "System")
+        sys_box.addWidget(self._label(
+            "Use the power icons in the right sidebar to shut down, restart, or sleep this computer.", "muted", wrap=True,
+        ))
+        lay.addStretch(1)
+        scroll.setWidget(body)
+        return scroll
 
     def _save_api_settings(self):
-        vals = {k: e.get().strip() for k, e in self.settings_entries.items()}
+        vals = {k: e.text().strip() for k, e in self.settings_entries.items()}
         apply_settings(vals)
         self.append_message("system", "⚙ Settings saved.")
 
@@ -1086,33 +1409,37 @@ class LunaApp(ctk.CTk):
         self.accent = THEMES[key]["accent"]
         self.accent2 = THEMES[key]["accent2"]
         apply_settings({"theme": key})
-        for fn in self._theme_appliers:
-            try:
-                fn()
-            except Exception:
-                pass
-        self._show_page(self.current_page_key)
+        self._apply_theme()
 
     # ---------------- right sidebar ----------------
     def _build_right_sidebar(self):
-        bar = ctk.CTkFrame(self, width=300, fg_color=PANEL_BG, corner_radius=0)
-        bar.grid(row=0, column=2, sticky="nsew")
-        bar.grid_propagate(False)
+        bar = QFrame()
+        bar.setObjectName("sidebar")
+        bar.setFixedWidth(300)
+        lay = QVBoxLayout(bar)
+        lay.setContentsMargins(20, 26, 20, 18)
+        lay.setSpacing(0)
 
-        prof = ctk.CTkFrame(bar, fg_color="transparent")
-        prof.pack(fill="x", padx=20, pady=(26, 14))
-        avatar_small = ctk.CTkLabel(prof, text="", image=self._load_avatar_image(52))
-        avatar_small.grid(row=0, column=0, rowspan=2, padx=(0, 10))
-        ctk.CTkLabel(prof, text="Luna", font=("Segoe UI", 16, "bold"), text_color=TEXT_LIGHT).grid(row=0, column=1, sticky="w")
-        status_row = ctk.CTkFrame(prof, fg_color="transparent")
-        status_row.grid(row=1, column=1, sticky="w")
-        ctk.CTkLabel(status_row, text="●", text_color="#33d17a", font=FONT_TINY).pack(side="left")
-        ctk.CTkLabel(status_row, text=" Online", text_color="#33d17a", font=FONT_SMALL).pack(side="left")
+        profile = QHBoxLayout()
+        profile.setSpacing(10)
+        avatar = QLabel()
+        avatar.setPixmap(make_avatar_pixmap(52))
+        avatar.setFixedSize(52, 52)
+        profile.addWidget(avatar)
+        who = QVBoxLayout()
+        who.setSpacing(0)
+        who.addWidget(self._label("Luna", "profileName"))
+        online = QLabel("●  Online")
+        online.setStyleSheet("color: #33d17a; font-size: 12px;")
+        who.addWidget(online)
+        profile.addLayout(who)
+        profile.addStretch(1)
+        lay.addLayout(profile)
+        lay.addSpacing(14)
 
-        self._section_header(bar, "◈  Quick Actions")
-        qa_grid = ctk.CTkFrame(bar, fg_color="transparent")
-        qa_grid.pack(fill="x", padx=20, pady=(6, 16))
-        qa_grid.grid_columnconfigure((0, 1), weight=1)
+        self._section_header(lay, "◈  Quick Actions")
+        grid = QGridLayout()
+        grid.setSpacing(12)
         actions = [
             ("💬", "Ask Anything", self.qa_ask_anything),
             ("✅", "Create Task", self.qa_create_task),
@@ -1120,74 +1447,78 @@ class LunaApp(ctk.CTk):
             ("🎙", "Voice Chat", self.qa_toggle_voice),
         ]
         for i, (icon, label, cmd) in enumerate(actions):
-            r, c = divmod(i, 2)
-            btn = ctk.CTkButton(
-                qa_grid, text=f"{icon}\n{label}", font=FONT_SMALL, fg_color=PANEL_BG2,
-                hover_color=PANEL_BORDER, text_color=TEXT_LIGHT, corner_radius=14, height=64, command=cmd,
-            )
-            btn.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            btn = QPushButton(f"{icon}\n{label}")
+            btn.setObjectName("qa")
+            btn.setMinimumHeight(64)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(cmd)
             if label == "Voice Chat":
+                btn.setCheckable(True)
                 self.voice_chat_btn = btn
+            grid.addWidget(btn, *divmod(i, 2))
+        lay.addLayout(grid)
+        lay.addSpacing(14)
 
-        self._section_header(bar, "🗓  Today's Overview")
-        overview_wrap = ctk.CTkFrame(bar, fg_color="transparent")
-        overview_wrap.pack(fill="x", padx=20, pady=(4, 16))
-        self.overview_values = {
-            "tasks": self._clickable_row(overview_wrap, "✅", "Tasks", self.show_tasks_popup),
-            "reminders": self._clickable_row(overview_wrap, "🔔", "Reminders", self.show_reminders_popup),
-            "messages": self._clickable_row(overview_wrap, "💬", "Messages", lambda: self._show_page("chat")),
-            "system": self._clickable_row(overview_wrap, "⚙", "System", lambda: self._show_page("settings")),
-        }
+        self._section_header(lay, "🗓  Today's Overview")
+        self.overview_values = {}
+        for key, icon, name, handler in (
+            ("tasks", "✅", "Tasks", self.show_tasks_popup),
+            ("reminders", "🔔", "Reminders", self.show_reminders_popup),
+            ("messages", "💬", "Messages", lambda: self._show_page("chat")),
+            ("system", "⚙", "System", lambda: self._show_page("settings")),
+        ):
+            row = ClickableRow(icon, name)
+            row.clicked.connect(handler)
+            lay.addWidget(row)
+            self.overview_values[key] = row.value
+        lay.addSpacing(14)
 
-        self._section_header(bar, "🖥  System Info")
-        info = ctk.CTkFrame(bar, fg_color="transparent")
-        info.pack(fill="x", padx=20, pady=(6, 10))
+        self._section_header(lay, "🖥  System Info")
         self.info_labels = {}
         for key, label in [("time", "Time"), ("date", "Date"), ("mood", "Mood"), ("uptime", "Uptime"), ("camera", "Camera")]:
-            row = ctk.CTkFrame(info, fg_color="transparent")
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=label, font=FONT_SMALL, text_color=TEXT_MUTED).pack(side="left")
-            val = ctk.CTkLabel(row, text="—", font=("Segoe UI", 11, "bold"), text_color=TEXT_LIGHT)
-            val.pack(side="right")
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 3, 0, 3)
+            row.addWidget(self._label(label, "muted"))
+            row.addStretch(1)
+            val = self._label("—", "infoValue")
+            row.addWidget(val)
+            lay.addLayout(row)
             self.info_labels[key] = val
+        lay.addSpacing(10)
 
-        power_row = ctk.CTkFrame(bar, fg_color="transparent")
-        power_row.pack(fill="x", padx=20, pady=(4, 12))
-        ctk.CTkButton(power_row, text="⏻ Shutdown", width=80, height=28, font=FONT_TINY, fg_color="#3a0a0a",
-                      hover_color="#5a1414", command=lambda: self._confirm_power("shutdown")).pack(side="left", padx=2)
-        ctk.CTkButton(power_row, text="⟳ Restart", width=80, height=28, font=FONT_TINY, fg_color="#2a2a0a",
-                      hover_color="#4a4a14", command=lambda: self._confirm_power("restart")).pack(side="left", padx=2)
-        ctk.CTkButton(power_row, text="☾ Sleep", width=80, height=28, font=FONT_TINY, fg_color="#0a1a3a",
-                      hover_color="#14285a", command=lambda: self._confirm_power("sleep")).pack(side="left", padx=2)
+        power = QHBoxLayout()
+        power.setSpacing(4)
+        for text, name, action in (
+            ("⏻ Shutdown", "powerShutdown", "shutdown"),
+            ("⟳ Restart", "powerRestart", "restart"),
+            ("☾ Sleep", "powerSleep", "sleep"),
+        ):
+            btn = QPushButton(text)
+            btn.setObjectName(name)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, a=action: self._confirm_power(a))
+            power.addWidget(btn)
+        lay.addLayout(power)
 
-        ctk.CTkLabel(bar, text="").pack(expand=True, fill="both")
-        self.right_quote_label = ctk.CTkLabel(
-            bar, text="", font=("Georgia", 10, "italic"), text_color=TEXT_MUTED, wraplength=250, justify="center",
-        )
-        self.right_quote_label.pack(side="bottom", pady=18, padx=20)
-
-    def _clickable_row(self, parent, icon, name, command):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", pady=3)
-        left = ctk.CTkLabel(row, text=f"{icon}  {name}", font=FONT_SMALL, text_color=TEXT_LIGHT, anchor="w")
-        left.pack(side="left")
-        val = ctk.CTkLabel(row, text="—", font=("Segoe UI", 11, "bold"), text_color=self.accent2, anchor="e")
-        val.pack(side="right")
-        for widget in (row, left, val):
-            widget.bind("<Button-1>", lambda e, c=command: c())
-        self._theme_appliers.append(lambda v=val: v.configure(text_color=self.accent2))
-        return val
+        lay.addStretch(1)
+        self.right_quote_label = self._label("", "quote", wrap=True, align=Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.right_quote_label)
+        return bar
 
     # ---------------- quick actions ----------------
     def qa_ask_anything(self):
         self._show_page("chat")
-        self.chat_entry.focus_set()
+        self.chat_entry.setFocus()
+
+    @staticmethod
+    def _new_item(text):
+        return {"id": str(uuid.uuid4()), "text": text, "done": False, "created_at": datetime.datetime.now().isoformat()}
 
     def qa_create_task(self):
-        dialog = ctk.CTkInputDialog(text="What's the task?", title="New Task")
-        val = dialog.get_input()
-        if val:
-            self.tasks.append({"id": str(uuid.uuid4()), "text": val, "done": False, "created_at": datetime.datetime.now().isoformat()})
+        val, ok = QInputDialog.getText(self, "New Task", "What's the task?")
+        val = val.strip()
+        if ok and val:
+            self.tasks.append(self._new_item(val))
             save_json(TASKS_PATH, self.tasks)
             self.update_overview()
             self.append_message("system", f"✅ Task added: {val}")
@@ -1197,52 +1528,53 @@ class LunaApp(ctk.CTk):
 
     def qa_toggle_voice(self):
         self.voice_listen_active = not self.voice_listen_active
+        self.voice_chat_btn.setChecked(self.voice_listen_active)
         if self.voice_listen_active:
-            self.voice_chat_btn.configure(fg_color=self.accent)
             threading.Thread(target=voice_loop, daemon=True).start()
-        else:
-            self.voice_chat_btn.configure(fg_color=PANEL_BG2)
 
     # ---------------- overview / system info ticking ----------------
     def update_overview(self):
-        if not hasattr(self, "overview_values"):
-            return
         pending = sum(1 for t in self.tasks if not t.get("done"))
         upcoming = sum(1 for r in self.reminders if not r.get("done"))
         today = datetime.date.today().isoformat()
         msgs_today = sum(1 for m in self.chat_history if m.get("ts", "").startswith(today))
         healthy = bool(GEMINI_API_KEY) and _PIPER_READY
-        self.overview_values["tasks"].configure(text=f"{pending} pending")
-        self.overview_values["reminders"].configure(text=f"{upcoming} upcoming")
-        self.overview_values["messages"].configure(text=f"{msgs_today} today")
-        self.overview_values["system"].configure(
-            text=("All good" if healthy else "Check Settings"),
-            text_color=("#33d17a" if healthy else "#ff9d4d"),
-        )
+        self.overview_values["tasks"].setText(f"{pending} pending")
+        self.overview_values["reminders"].setText(f"{upcoming} upcoming")
+        self.overview_values["messages"].setText(f"{msgs_today} today")
+        system_value = self.overview_values["system"]
+        system_value.setText("All good" if healthy else "Check Settings")
+        color = "#33d17a" if healthy else "#ff9d4d"
+        if color != self._system_color:
+            self._system_color = color
+            system_value.setStyleSheet(f"color: {color};")
 
     def _tick_system_info(self):
         now = datetime.datetime.now()
-        self.info_labels["time"].configure(text=now.strftime("%I:%M %p"))
-        self.info_labels["date"].configure(text=now.strftime("%b %d, %Y"))
+        self.info_labels["time"].setText(now.strftime("%I:%M %p"))
+        self.info_labels["date"].setText(now.strftime("%b %d, %Y"))
         mood_map = {"idle": "Calm ♡", "listening": "Curious ✦", "speaking": "Chatty ♪", "executing": "Focused ⚡", "confirm": "Alert ⚠"}
-        self.info_labels["mood"].configure(text=mood_map.get(self.current_mode, "Calm ♡"))
+        self.info_labels["mood"].setText(mood_map.get(self.current_mode, "Calm ♡"))
         elapsed = int(time.time() - self.start_time)
         h, rem = divmod(elapsed, 3600)
         m, s = divmod(rem, 60)
-        self.info_labels["uptime"].configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+        self.info_labels["uptime"].setText(f"{h:02d}:{m:02d}:{s:02d}")
         self.update_overview()
-        self.after(1000, self._tick_system_info)
 
     def _rotate_quote(self):
-        text = LUNA_QUOTES[self.quote_index % len(LUNA_QUOTES)]
+        text = f"“{LUNA_QUOTES[self.quote_index % len(LUNA_QUOTES)]}”"
         self.quote_index += 1
-        if hasattr(self, "quote_label"):
-            self.quote_label.configure(text=f"“{text}”")
-        if hasattr(self, "right_quote_label"):
-            self.right_quote_label.configure(text=f"“{text}”")
-        self.after(9000, self._rotate_quote)
+        self.quote_label.setText(text)
+        self.right_quote_label.setText(text)
 
     # ---------------- popups / modals ----------------
+    def _make_dialog(self, title, width, height):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(width, height)
+        dlg.setModal(True)
+        return dlg
+
     def show_tasks_popup(self):
         self._show_list_popup("Tasks", self.tasks, TASKS_PATH, "New task", "No tasks yet — add one!")
 
@@ -1250,46 +1582,28 @@ class LunaApp(ctk.CTk):
         self._show_list_popup("Reminders", self.reminders, REMINDERS_PATH, "New reminder", "No reminders yet — add one!")
 
     def _show_list_popup(self, title, items, path, add_prompt, empty_text):
-        modal = ctk.CTkToplevel(self)
-        modal.title(title)
-        modal.geometry("380x440")
-        modal.configure(fg_color=PANEL_BG)
-        modal.transient(self)
-        modal.update_idletasks()
-        modal.deiconify()
-        modal.wait_visibility()
-        modal.grab_set()
+        dlg = self._make_dialog(title, 380, 440)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(14, 16, 14, 16)
+        root.setSpacing(8)
+        root.addWidget(self._label(title, "h1", align=Qt.AlignmentFlag.AlignCenter))
 
-        ctk.CTkLabel(modal, text=title, font=FONT_H1, text_color=TEXT_LIGHT).pack(pady=(16, 8))
-        scroll = ctk.CTkScrollableFrame(modal, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("transparent")
+        rows = QVBoxLayout(body)
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(8)
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
 
-        def refresh():
-            for w in scroll.winfo_children():
-                w.destroy()
-            if not items:
-                ctk.CTkLabel(scroll, text=empty_text, text_color=TEXT_MUTED).pack(pady=10)
-                return
-            for it in list(items):
-                row = ctk.CTkFrame(scroll, fg_color=PANEL_BG2, corner_radius=10)
-                row.pack(fill="x", pady=4)
-                done = it.get("done", False)
-                cb = ctk.CTkCheckBox(
-                    row, text=it["text"], font=FONT_SMALL, text_color=(TEXT_MUTED if done else TEXT_LIGHT),
-                    onvalue=True, offvalue=False, command=lambda i=it: toggle(i),
-                )
-                if done:
-                    cb.select()
-                cb.pack(side="left", padx=8, pady=8, fill="x", expand=True)
-                ctk.CTkButton(
-                    row, text="✕", width=28, height=28, fg_color="transparent", hover_color="#5a1414",
-                    text_color="#ff6b6b", command=lambda i=it: remove(i),
-                ).pack(side="right", padx=6)
-
-        def toggle(it):
-            it["done"] = not it.get("done", False)
+        def toggle(it, cb, checked):
+            it["done"] = checked
             save_json(path, items)
-            refresh()
+            cb.setStyleSheet(f"color: {TEXT_MUTED};" if checked else "")
             self.update_overview()
 
         def remove(it):
@@ -1298,73 +1612,104 @@ class LunaApp(ctk.CTk):
             refresh()
             self.update_overview()
 
+        def make_row(it):
+            row = QFrame()
+            row.setObjectName("inner")
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(10, 6, 6, 6)
+            cb = QCheckBox(it["text"])
+            done = it.get("done", False)
+            cb.setChecked(done)
+            if done:
+                cb.setStyleSheet(f"color: {TEXT_MUTED};")
+            cb.toggled.connect(lambda checked, i=it, c=cb: toggle(i, c, checked))
+            lay.addWidget(cb, 1)
+            del_btn = QPushButton("✕")
+            del_btn.setObjectName("dangerLink")
+            del_btn.setFixedSize(28, 28)
+            del_btn.clicked.connect(lambda _=False, i=it: remove(i))
+            lay.addWidget(del_btn)
+            return row
+
+        def refresh():
+            _clear_layout(rows)
+            if not items:
+                rows.addWidget(self._label(empty_text, "muted", align=Qt.AlignmentFlag.AlignCenter))
+            for it in list(items):
+                rows.addWidget(make_row(it))
+            rows.addStretch(1)
+
         def add_new():
-            dialog = ctk.CTkInputDialog(text=add_prompt, title=add_prompt)
-            val = dialog.get_input()
-            if val:
-                items.append({"id": str(uuid.uuid4()), "text": val, "done": False, "created_at": datetime.datetime.now().isoformat()})
+            val, ok = QInputDialog.getText(dlg, add_prompt, add_prompt)
+            val = val.strip()
+            if ok and val:
+                items.append(self._new_item(val))
                 save_json(path, items)
                 refresh()
                 self.update_overview()
 
         refresh()
-        ctk.CTkButton(modal, text="+ Add", fg_color=self.accent, hover_color=self.accent2, command=add_new).pack(pady=(0, 16))
+        add_btn = QPushButton("+ Add")
+        add_btn.setObjectName("primary")
+        add_btn.clicked.connect(add_new)
+        root.addWidget(add_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        dlg.exec()
 
     def _show_open_apps_popup(self):
-        modal = ctk.CTkToplevel(self)
-        modal.title("Open App")
-        modal.geometry("320x300")
-        modal.configure(fg_color=PANEL_BG)
-        modal.transient(self)
-        modal.update_idletasks()
-        modal.deiconify()
-        modal.wait_visibility()
-        modal.grab_set()
-        ctk.CTkLabel(modal, text="Open an App", font=FONT_H1, text_color=TEXT_LIGHT).pack(pady=(16, 10))
+        dlg = self._make_dialog("Open App", 320, 300)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+        lay.addWidget(self._label("Open an App", "h1", align=Qt.AlignmentFlag.AlignCenter))
         apps = [
             ("🌐", "Browser", "browser"), ("📁", "Files", "files"), ("⌨", "Terminal", "terminal"),
             ("🧮", "Calculator", "calculator"), ("📝", "Notepad", "notepad"),
         ]
         for icon, label, kind in apps:
-            ctk.CTkButton(
-                modal, text=f"{icon}  {label}", anchor="w", font=FONT_BODY, fg_color=PANEL_BG2,
-                hover_color=PANEL_BORDER, text_color=TEXT_LIGHT, corner_radius=10, height=38,
-                command=lambda k=kind, m=modal: (_launch_app(k), m.destroy()),
-            ).pack(fill="x", padx=20, pady=4)
+            btn = QPushButton(f"{icon}  {label}")
+            btn.setObjectName("appBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, k=kind: (_launch_app(k), dlg.accept()))
+            lay.addWidget(btn)
+        lay.addStretch(1)
+        dlg.exec()
 
     def _confirm_power(self, action):
-        modal = ctk.CTkToplevel(self)
-        modal.title("Confirm")
-        modal.geometry("340x160")
-        modal.configure(fg_color=PANEL_BG)
-        modal.transient(self)
-        modal.update_idletasks()
-        modal.deiconify()
-        modal.wait_visibility()
-        modal.grab_set()
+        dlg = self._make_dialog("Confirm", 340, 160)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 24, 16, 16)
         verbs = {"shutdown": "shut down", "restart": "restart", "sleep": "put to sleep"}
-        ctk.CTkLabel(
-            modal, text=f"Are you sure you want to {verbs[action]} the system?",
-            font=FONT_BODY, text_color=TEXT_LIGHT, wraplength=280, justify="center",
-        ).pack(pady=(24, 16), padx=16)
-        row = ctk.CTkFrame(modal, fg_color="transparent")
-        row.pack()
+        lay.addWidget(self._label(
+            f"Are you sure you want to {verbs[action]} the system?", wrap=True, align=Qt.AlignmentFlag.AlignCenter,
+        ))
+        lay.addStretch(1)
 
         def confirm():
-            modal.destroy()
+            dlg.accept()
             threading.Thread(target=_execute_system_action, args=(action,), daemon=True).start()
 
-        ctk.CTkButton(row, text="Yes, proceed", fg_color="#a83232", hover_color="#c94040", command=confirm).pack(side="left", padx=8)
-        ctk.CTkButton(row, text="Cancel", fg_color=PANEL_BG2, hover_color=PANEL_BORDER, command=modal.destroy).pack(side="left", padx=8)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        yes_btn = QPushButton("Yes, proceed")
+        yes_btn.setObjectName("danger")
+        yes_btn.clicked.connect(confirm)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        row.addWidget(yes_btn)
+        row.addWidget(cancel_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        dlg.exec()
 
-    def on_close(self):
+    def closeEvent(self, event):
         global _app_running
+        self._closed = True
         _app_running = False
         _stop_speech_flag.set()
         speech_done_event.set()
         self.voice_listen_active = False
         logging.info("Luna window closed cleanly.")
-        self.destroy()
+        event.accept()
 
 
 # ------------------------------------------------------------
@@ -1490,7 +1835,7 @@ def voice_loop():
             if not process_command(command):
                 if app:
                     app.voice_listen_active = False
-                    app.voice_chat_btn.configure(fg_color=PANEL_BG2)
+                    app.set_voice_chat_active(False)
                 break
     if app:
         app.set_mode("idle")
@@ -2054,15 +2399,52 @@ def process_command(command: str) -> bool:
 # ------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------
+def _log_uncaught_exception(exc_type, exc_value, exc_tb):
+    # PyQt6 aborts the process on an unhandled exception inside a slot; log instead.
+    logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _build_palette() -> QPalette:
+    palette = QPalette()
+    for role, color in (
+        (QPalette.ColorRole.Window, BG_DARK),
+        (QPalette.ColorRole.WindowText, TEXT_LIGHT),
+        (QPalette.ColorRole.Base, PANEL_BG2),
+        (QPalette.ColorRole.AlternateBase, PANEL_BG),
+        (QPalette.ColorRole.Text, TEXT_LIGHT),
+        (QPalette.ColorRole.Button, PANEL_BG2),
+        (QPalette.ColorRole.ButtonText, TEXT_LIGHT),
+        (QPalette.ColorRole.PlaceholderText, TEXT_MUTED),
+        (QPalette.ColorRole.Highlight, THEMES[THEME_NAME]["accent"]),
+        (QPalette.ColorRole.HighlightedText, "#ffffff"),
+    ):
+        palette.setColor(role, QColor(color))
+    return palette
+
+
 if __name__ == "__main__":
+    sys.excepthook = _log_uncaught_exception
+    qt_app = QApplication(sys.argv)
+    qt_app.setStyle("Fusion")
+    ui_font = QFont()
+    ui_font.setFamilies(UI_FONT_FAMILIES)
+    qt_app.setFont(ui_font)
+    qt_app.setPalette(_build_palette())
+
     app = LunaApp()
+    app.show()
     app.append_message(
         "luna",
         f"Hello {USER_NAME}! I'm Luna, your mystical assistant. Type below or tap the "
         "mic whenever you're ready — or turn on Voice Chat for hands-free conversation.",
     )
-    start_face_recognition()
+    face_thread = start_face_recognition()
     try:
-        app.mainloop()
+        exit_code = qt_app.exec()
     except Exception as e:
         logging.critical(f"Main window loop crashed: {e}")
+        exit_code = 1
+    _app_running = False
+    if face_thread is not None:
+        face_thread.join(timeout=3)  # let the camera loop release the webcam before Qt tears down
+    sys.exit(exit_code)
